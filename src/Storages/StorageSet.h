@@ -30,6 +30,9 @@ public:
     bool storesDataOnDisk() const override { return true; }
     Strings getDataPaths() const override { return {path}; }
 
+    void cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context) override;
+    bool supportsCloneData() const override { return true; }
+
 protected:
     StorageSetOrJoinBase(
         DiskPtr disk_,

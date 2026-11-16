@@ -318,6 +318,16 @@ public:
     /// Returns true if the storage supports backup/restore for specific partitions.
     virtual bool supportsBackupPartition() const { return false; }
 
+    /// Writes a copy of the table's data to `dst_relative_data_path` on each of the disks that hold its data, so that a table
+    /// with the same definition, attached at that path, has the data this table has now. Files that never change once written
+    /// are hard-linked rather than copied, so the copy costs little time or space whatever the size of the table.
+    /// Used by `CREATE DATABASE ... CLONE AS` and `SYSTEM BRANCH`. The caller holds the table's alter lock, so that the
+    /// definition it copies and the data agree.
+    virtual void cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context);
+
+    /// Returns true if the storage implements `cloneDataToPath`.
+    virtual bool supportsCloneData() const { return false; }
+
     /// Called after all databases and tables on all replicas have been restored from backup.
     /// If this data does some background work that depends on contents of other tables, this is
     /// the place to kick off that work (and it should be paused when IStorage is created with

@@ -73,6 +73,9 @@ public:
     void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
     void restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
 
+    void cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context) override;
+    bool supportsCloneData() const override { return true; }
+
 private:
     using ReadLock = std::shared_lock<std::shared_timed_mutex>;
     using WriteLock = std::unique_lock<std::shared_timed_mutex>;

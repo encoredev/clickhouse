@@ -453,6 +453,18 @@ void StorageMemory::mutate(const MutationCommands & commands, ContextPtr context
 }
 
 
+void StorageMemory::cloneDataFrom(const StorageMemory & source)
+{
+    const auto source_data = source.data.get();
+    auto new_data = std::make_unique<BlocksWithCounts>();
+    new_data->blocks = source_data->blocks;
+    new_data->rows = source_data->rows;
+    new_data->bytes = source_data->bytes;
+
+    std::lock_guard lock(mutex);
+    setData(std::move(new_data));
+}
+
 void StorageMemory::truncate(
     const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &)
 {

@@ -407,6 +407,12 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
             ostr << quoteString(backup_name);
             break;
         }
+        case Type::BRANCH:
+        {
+            print_keyword(" TO ");
+            ostr << quoteString(branch_path);
+            break;
+        }
         case Type::UNLOCK_SNAPSHOT:
         {
             ostr << " " << quoteString(backup_name);
@@ -749,6 +755,8 @@ void ASTSystemQuery::writeJSON(WriteBuffer & out) const
         w.writeUInt("offset_to_drop", *offset_to_drop);
     if (!backup_name.empty())
         w.writeString("backup_name", backup_name);
+    if (!branch_path.empty())
+        w.writeString("branch_path", branch_path);
     w.writeChild("backup_source", backup_source);
     w.writeChild("scheduled_merge_parts", scheduled_merge_parts);
     if (!schema_cache_storage.empty())
@@ -925,6 +933,7 @@ void ASTSystemQuery::readJSON(const Poco::JSON::Object & json)
     if (r.has("offset_to_drop"))
         offset_to_drop = r.getUInt("offset_to_drop");
     backup_name = r.getString("backup_name");
+    branch_path = r.getString("branch_path");
     backup_source = r.readChild("backup_source");
     if (backup_source)
         children.push_back(backup_source);

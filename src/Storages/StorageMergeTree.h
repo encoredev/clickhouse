@@ -110,6 +110,9 @@ public:
     /// Makes backup entries to backup the data of the storage.
     void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
 
+    void cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context) override;
+    bool supportsCloneData() const override { return true; }
+
     void drop() override;
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
 
