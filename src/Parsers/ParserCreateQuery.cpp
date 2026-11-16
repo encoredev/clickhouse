@@ -1416,17 +1416,35 @@ bool ParserCreateDatabaseQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & e
             return false;
     }
 
-    storage_p.parse(pos, storage, expected);
-    auto comment = parseComment(pos, expected);
+    /// `CREATE DATABASE db CLONE AS source`: the new database is a copy of `source`, engine included.
+    String clone_source;
+    ASTPtr comment;
+    if (!attach && ParserKeyword{Keyword::CLONE_AS}.ignore(pos, expected))
+    {
+        ASTPtr source;
+        if (!ParserIdentifier{}.parse(pos, source, expected))
+            return false;
+        clone_source = getIdentifierName(source);
+    }
+    else
+    {
+        storage_p.parse(pos, storage, expected);
+        comment = parseComment(pos, expected);
 
-    if (!table_overrides_p.parse(pos, table_overrides, expected))
-        return false;
+        if (!table_overrides_p.parse(pos, table_overrides, expected))
+            return false;
+    }
 
     auto query = make_intrusive<ASTCreateQuery>();
     node = query;
 
     query->attach = attach;
     query->if_not_exists = if_not_exists;
+    if (!clone_source.empty())
+    {
+        query->is_clone_as = true;
+        query->as_database = clone_source;
+    }
 
     query->uuid = uuid;
     query->has_uuid = uuid != UUIDHelpers::Nil;

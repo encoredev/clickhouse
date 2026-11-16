@@ -147,6 +147,7 @@ namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
     extern const MergeTreeSettingsBool fsync_part_directory;
+    extern const MergeTreeSettingsUInt64 max_bytes_to_buffer_for_packed_part;
     extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
@@ -4736,6 +4737,79 @@ BackupEntries StorageMergeTree::backupMutations(UInt64 version, const String & d
     for (auto it = current_mutations_by_version.lower_bound(version); it != current_mutations_by_version.end(); ++it)
         backup_entries.emplace_back(mutations_path_in_backup / fmt::format("{:010}.txt", it->first), it->second.backup());
     return backup_entries;
+}
+
+
+void StorageMergeTree::cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context)
+{
+    /// The delete bitmaps of a table with a unique key are filed under the paths of its parts.
+    if (auto uk_metadata = getInMemoryMetadataPtr(local_context, false); uk_metadata && uk_metadata->hasUniqueKey())
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Cannot copy table {} with CLONE AS or BRANCH: tables with a UNIQUE KEY are not supported",
+            getStorageID().getNameForLogs());
+
+    const auto disks = getDisks();
+    for (const auto & disk : disks)
+    {
+        if (disk->isRemote())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot copy table {} with CLONE AS or BRANCH: it keeps data on the remote disk {}",
+                getStorageID().getNameForLogs(), disk->getName());
+    }
+
+    const auto read_settings = local_context->getReadSettings();
+    const auto write_settings = local_context->getWriteSettings();
+
+    /// The parts first, then the mutations, as `BACKUP` does: a mutation the parts have not caught up with is
+    /// still there afterwards, so the copy finishes it as this table will. A mutation made in between is copied
+    /// too, and applied to the copy's parts as it is to this table's.
+    const auto parts = getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch});
+
+    for (const auto & disk : disks)
+    {
+        if (disk->isBroken())
+            continue;
+
+        disk->createDirectories(fs::path(dst_relative_data_path) / DETACHED_DIR_NAME);
+
+        /// `format_version.txt` is rewritten in place when the table is created, so it is copied rather than linked.
+        const auto format_version_path = fs::path(relative_data_path) / FORMAT_VERSION_FILE_NAME;
+        if (disk->existsFile(format_version_path))
+            disk->copyFile(format_version_path, *disk, fs::path(dst_relative_data_path) / FORMAT_VERSION_FILE_NAME, read_settings, write_settings);
+    }
+
+    /// The parts are linked as `ALTER TABLE ... FREEZE` links them: their files never change once written, and are
+    /// made read-only. The copy keeps their names, their metadata versions and everything else in them, so that it
+    /// reads the same. Holding the parts keeps a merge from removing their directories meanwhile.
+    for (const auto & part : parts)
+    {
+        IDataPartStorage::ClonePartParams params
+        {
+            .keep_metadata_version = true,
+            .make_source_readonly = true,
+            .fsync_part_directory = true,
+            .temporary_data = local_context->getTempDataOnDisk(),
+            .max_bytes_to_buffer_for_packed_part = (*getSettings())[MergeTreeSetting::max_bytes_to_buffer_for_packed_part],
+        };
+
+        part->getDataPartStorage().freeze(
+            dst_relative_data_path,
+            part->getDataPartStorage().getPartDirectory(),
+            read_settings,
+            write_settings,
+            /* save_metadata_callback= */ {},
+            params);
+    }
+
+    /// The deduplication log is not copied: the copy starts with an empty one.
+    std::lock_guard lock(currently_processing_in_background_mutex);
+    for (const auto & [version, entry] : current_mutations_by_version)
+        entry.disk->copyFile(
+            fs::path(entry.path_prefix) / entry.file_name,
+            *entry.disk,
+            fs::path(dst_relative_data_path) / entry.file_name,
+            read_settings,
+            write_settings);
 }
 
 

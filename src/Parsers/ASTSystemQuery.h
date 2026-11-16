@@ -121,6 +121,7 @@ public:
         START_THREAD_FUZZER,
         STOP_THREAD_FUZZER,
         UNFREEZE,
+        BRANCH,
         ENABLE_FAILPOINT,
         DISABLE_FAILPOINT,
         DISABLE_ALL_FAILPOINTS,
@@ -230,6 +231,8 @@ public:
 
     String backup_name;
     ASTPtr backup_source; /// SYSTEM UNFREEZE SNAPSHOT `backup_name` FROM `backup_source`
+
+    String branch_path; /// SYSTEM BRANCH TO `branch_path`
 
     String schema_cache_storage;
 

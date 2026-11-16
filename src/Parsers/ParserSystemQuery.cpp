@@ -915,6 +915,14 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             }
             break;
         }
+        case Type::BRANCH:
+        {
+            ASTPtr ast;
+            if (!ParserKeyword{Keyword::TO}.ignore(pos, expected) || !ParserStringLiteral{}.parse(pos, ast, expected))
+                return false;
+            res->branch_path = ast->as<ASTLiteral &>().value.safeGet<String>();
+            break;
+        }
         case Type::UNLOCK_SNAPSHOT:
         {
 
@@ -2066,6 +2074,16 @@ Clears a frozen backup with the specified name from all the disks. See more abou
 SYSTEM UNFREEZE WITH NAME <backup_name>
 ```
 
+### SYSTEM BRANCH {#branch}
+
+Copies the server into a new data directory while it runs. Tables share their files with the original until either writes to them.
+
+```sql
+SYSTEM BRANCH TO '/path/to/branch'
+```
+
+Requires the `SYSTEM BRANCH` privilege.
+
 ### SYSTEM UNLOCK SNAPSHOT {#unlock-snapshot}
 
 Introduced in: v25.3.0
@@ -2616,6 +2634,7 @@ SYSTEM RESTART REPLICA | RESTORE REPLICA [db.]name
 SYSTEM REFRESH VIEW | WAIT VIEW | CANCEL VIEW [db.]name
 SYSTEM WAIT QUERY RUNNER [db.]name
 SYSTEM UNFREEZE WITH NAME 'backup_name'
+SYSTEM BRANCH TO 'path'
 SYSTEM UNLOCK SNAPSHOT 'snapshot_id' [FROM backup_destination]
 SYSTEM FLUSH OBJECT STORAGE QUEUE
 SYSTEM RESET FILELOG [db.]name [FILE 'file_name' [OFFSET n | TO END]]

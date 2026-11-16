@@ -485,6 +485,11 @@ void IStorage::restoreDataFromBackup(RestorerFromBackup & restorer, const String
                         getStorageID().getFullTableName(), data_path_in_backup);
 }
 
+void IStorage::cloneDataToPath(const String & /*dst_relative_data_path*/, ContextPtr /*local_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Table engine {} does not support copying its data with CLONE AS or BRANCH", getName());
+}
+
 std::string PrewhereInfo::dump() const
 {
     WriteBufferFromOwnString ss;

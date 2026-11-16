@@ -831,10 +831,12 @@ void ASTCreateQuery::readJSON(const Poco::JSON::Object & json)
     if (!table && !database)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "`CreateQuery` must specify at least one of 'database' or 'table' during AST JSON deserialization");
 
+    /// `CREATE DATABASE db CLONE AS source` names its source in `as_database` alone.
+    const bool is_database_clone = is_clone_as && as_table.empty() && !as_database.empty() && !select && !as_table_function;
     const bool requires_table =
         is_ordinary_view || is_materialized_view
         || is_dictionary || is_time_series_table
-        || is_populate || is_create_empty || is_clone_as
+        || is_populate || is_create_empty || (is_clone_as && !is_database_clone)
         || replace_view || replace_table || create_or_replace
         || has_attach_from_path || attach_as_replicated.has_value()
         || columns_list || aliases_list || select
@@ -981,7 +983,7 @@ void ASTCreateQuery::readJSON(const Poco::JSON::Object & json)
 
     /// `CLONE` requires an `AS` clause, so one of `AS SELECT` / `AS table` / `AS table function` is
     /// always present. Without one, formatting emits a trailing ` CLONE` that cannot be reparsed.
-    if (is_clone_as && !select && !as_table_function && as_table.empty())
+    if (is_clone_as && !select && !as_table_function && as_table.empty() && !(is_database_clone && database && !table))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "`CreateQuery` declares 'is_clone_as' without a source to clone from during AST JSON "
             "deserialization");
@@ -1003,6 +1005,10 @@ void ASTCreateQuery::formatQueryImpl(WriteBuffer & ostr, const FormatSettings & 
             ostr << " UUID " << quoteString(toString(uuid));
 
         formatOnCluster(ostr, settings);
+
+        /// `CREATE DATABASE db CLONE AS source`
+        if (is_clone_as)
+            ostr << " CLONE AS " << backQuoteIfNeed(as_database);
 
         if (storage)
             storage->format(ostr, settings, state, frame);
