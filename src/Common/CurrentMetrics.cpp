@@ -306,6 +306,9 @@
     M(OutdatedPartsLoadingThreads, "Number of threads in the threadpool for loading Outdated data parts.") \
     M(OutdatedPartsLoadingThreadsActive, "Number of active threads in the threadpool for loading Outdated data parts.") \
     M(OutdatedPartsLoadingThreadsScheduled, "Number of queued or active jobs in the threadpool for loading Outdated data parts.") \
+    M(DatabaseCopyThreads, "Number of threads in the threadpool for copying tables with CREATE DATABASE ... CLONE AS and SYSTEM BRANCH.") \
+    M(DatabaseCopyThreadsActive, "Number of active threads in the threadpool for copying tables with CREATE DATABASE ... CLONE AS and SYSTEM BRANCH.") \
+    M(DatabaseCopyThreadsScheduled, "Number of queued or active jobs in the threadpool for copying tables with CREATE DATABASE ... CLONE AS and SYSTEM BRANCH.") \
     M(FreezePartThreads, "Number of threads in the threadpool for freezing data parts.") \
     M(FreezePartThreadsActive, "Number of active threads in the threadpool for freezing data parts.") \
     M(FreezePartThreadsScheduled, "Number of queued or active jobs in the threadpool for freezing data parts.") \

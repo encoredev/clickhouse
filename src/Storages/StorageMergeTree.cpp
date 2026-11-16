@@ -1,7 +1,12 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageProxy.h>
+#include <Common/ErrnoException.h>
 
 #include <optional>
+
+#if defined(OS_DARWIN)
+#    include <sys/clonefile.h>
+#endif
 #include <ranges>
 #include <set>
 #include <thread>
@@ -171,6 +176,7 @@ namespace MergeTreeSetting
 
 namespace ErrorCodes
 {
+    extern const int CANNOT_LINK;
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int NOT_ENOUGH_SPACE;
@@ -4740,6 +4746,28 @@ BackupEntries StorageMergeTree::backupMutations(UInt64 version, const String & d
 }
 
 
+namespace
+{
+
+/// Clones the directory `from` to `to` with one call to a file system that can share the data of files between
+/// them, APFS: cheaper than linking each file of a part, and the copies are independent of the originals from the
+/// start. Returns false if the file system cannot.
+bool tryCloneDirectoryOnFileSystem(const fs::path & from, const fs::path & to)
+{
+#if defined(OS_DARWIN)
+    if (::clonefile(from.c_str(), to.c_str(), CLONE_NOFOLLOW) == 0)
+        return true;
+    if (errno == ENOTSUP || errno == EXDEV)
+        return false;
+    throw ErrnoException(ErrorCodes::CANNOT_LINK, "Cannot clone {} to {}", from.string(), to.string());
+#else
+    UNUSED(from, to);
+    return false;
+#endif
+}
+
+}
+
 void StorageMergeTree::cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context)
 {
     /// The delete bitmaps of a table with a unique key are filed under the paths of its parts.
@@ -4778,11 +4806,41 @@ void StorageMergeTree::cloneDataToPath(const String & dst_relative_data_path, Co
             disk->copyFile(format_version_path, *disk, fs::path(dst_relative_data_path) / FORMAT_VERSION_FILE_NAME, read_settings, write_settings);
     }
 
-    /// The parts are linked as `ALTER TABLE ... FREEZE` links them: their files never change once written, and are
-    /// made read-only. The copy keeps their names, their metadata versions and everything else in them, so that it
-    /// reads the same. Holding the parts keeps a merge from removing their directories meanwhile.
+    /// Where the file system can clone a directory (APFS), each part is cloned with one call. Elsewhere the parts are
+    /// linked as `ALTER TABLE ... FREEZE` links them: their files never change once written, and are made read-only.
+    /// Either way the copy keeps their names, their metadata versions and everything else in them, so that it reads
+    /// the same. Holding the parts keeps a merge from removing their directories meanwhile.
+    std::unordered_map<String, bool> clone_directories_on_disk;
+    for (const auto & disk : disks)
+    {
+        const auto description = disk->getDataSourceDescription();
+        clone_directories_on_disk[disk->getName()]
+            = description.type == DataSourceType::Local && !description.is_encrypted && !description.is_cached;
+    }
+
+    std::set<DiskPtr> disks_with_cloned_parts;
     for (const auto & part : parts)
     {
+        const auto & part_storage = part->getDataPartStorage();
+        auto & clone_directories = clone_directories_on_disk[part_storage.getDiskName()];
+        if (clone_directories)
+        {
+            const auto disk = getStoragePolicy()->getDiskByName(part_storage.getDiskName());
+            const auto dst_part_path = fs::path(dst_relative_data_path) / part_storage.getPartDirectory();
+            if (tryCloneDirectoryOnFileSystem(part_storage.getFullPath(), fs::path(disk->getPath()) / dst_part_path))
+            {
+                /// As `freeze` does: the copy is not part of a transaction, and is not to be removed.
+                disk->removeFileIfExists(dst_part_path / "delete-on-destroy.txt");
+                disk->removeFileIfExists(dst_part_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
+                disk->removeFileIfExists(dst_part_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+                if (auto guard = disk->getDirectorySyncGuard(dst_part_path))
+                    guard->sync();
+                disks_with_cloned_parts.insert(disk);
+                continue;
+            }
+            clone_directories = false;
+        }
+
         IDataPartStorage::ClonePartParams params
         {
             .keep_metadata_version = true,
@@ -4799,6 +4857,16 @@ void StorageMergeTree::cloneDataToPath(const String & dst_relative_data_path, Co
             write_settings,
             /* save_metadata_callback= */ {},
             params);
+    }
+
+    /// The directory entries of the cloned parts, and of the table's directory itself.
+    for (const auto & disk : disks_with_cloned_parts)
+    {
+        for (const auto & path : {fs::path(dst_relative_data_path), fs::path(dst_relative_data_path).parent_path().parent_path()})
+        {
+            if (auto guard = disk->getDirectorySyncGuard(path))
+                guard->sync();
+        }
     }
 
     /// The deduplication log is not copied: the copy starts with an empty one.
