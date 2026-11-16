@@ -89,6 +89,8 @@
 #include <DataTypes/hasNullable.h>
 
 #include <Databases/DatabaseBackup.h>
+#include <Databases/DatabaseCopy.h>
+#include <Storages/StorageMemory.h>
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DatabaseOnDisk.h>
 #include <Databases/DatabaseOrdinary.h>
@@ -303,6 +305,20 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         throw Exception(ErrorCodes::DATABASE_ALREADY_EXISTS, "Database {} already exists.", database_name);
     }
 
+    /// `CREATE DATABASE db CLONE AS source`: the new database has the engine of the source, `Atomic`, and copies of
+    /// its tables, which share their files with the source's until either writes to them.
+    DatabasePtr clone_source;
+    if (create.is_clone_as)
+    {
+        if (create.attach || create.storage || !create.cluster.empty())
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "CREATE DATABASE ... CLONE AS takes neither ATTACH, an engine nor ON CLUSTER");
+        clone_source = DatabaseCatalog::instance().getDatabase(create.as_database);
+        if (clone_source->getEngineName() != "Atomic")
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot clone database {}: its engine is {}, and only Atomic databases can be cloned",
+                backQuoteIfNeed(create.as_database), clone_source->getEngineName());
+    }
+
     auto db_num_limit = getContext()->getGlobalContext()->getMaxDatabaseNumToThrow();
     if (db_num_limit > 0 && !internal)
     {
@@ -439,6 +455,10 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
     if (create.uuid != UUIDHelpers::Nil)
         create.setDatabase(TABLE_WITH_UUID_NAME_PLACEHOLDER);
 
+    /// The stored definition is that of an ordinary database.
+    create.is_clone_as = false;
+    create.as_database.clear();
+
     if (need_write_metadata)
     {
         create.attach = true;
@@ -466,8 +486,27 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
 
     bool added = false;
     bool renamed = false;
+    CopiedDatabaseTables copied_tables;
     try
     {
+        /// The copies of the source's tables are written into the new database's directory before it is attached,
+        /// and loaded as the server loads a database when it starts. Until the database's metadata file is in place,
+        /// nothing refers to them; after a crash, the store cleanup removes them.
+        if (clone_source)
+        {
+            copied_tables = copyDatabaseTables(
+                clone_source,
+                DatabaseCopyTarget{
+                    .database_name = database_name,
+                    .new_uuids = true,
+                    .metadata_path = metadata_path,
+                    .data_path_prefix = {},
+                    .required_data_root = {},
+                },
+                getContext());
+            mode = getLoadingStrictnessLevel(/* attach= */ true, force_attach, has_force_restore_data_flag, /* secondary= */ false);
+        }
+
         /// TODO Attach db only after it was loaded. Now it's not possible because of view dependencies
         DatabaseCatalog::instance().attachDatabase(database_name, database);
         added = true;
@@ -490,6 +529,13 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
             /// Only then prioritize, schedule and wait all the startup tasks
             waitLoad(currentPoolOr(TablesLoaderForegroundPoolId), startup_tasks);
         }
+
+        /// `Memory` tables keep their data in memory: the copies share the source's blocks.
+        for (const auto & [table_name, source_table] : copied_tables.memory_tables)
+        {
+            auto table = database->getTable(table_name, getContext());
+            typeid_cast<StorageMemory &>(*table).cloneDataFrom(typeid_cast<const StorageMemory &>(*source_table));
+        }
     }
     catch (...)
     {
@@ -500,6 +546,13 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         }
         if (added)
             DatabaseCatalog::instance().detachDatabase(getContext(), database_name, false, false);
+
+        if (clone_source)
+        {
+            copied_tables.removeData(getContext());
+            if (default_db_disk->existsDirectory(metadata_path))
+                default_db_disk->removeRecursive(metadata_path);
+        }
 
         throw;
     }
@@ -4061,6 +4114,13 @@ AccessRightsElements InterpreterCreateQuery::getRequiredAccess() const
     if (!create.table)
     {
         required_access.emplace_back(AccessType::CREATE_DATABASE, create.getDatabase());
+        /// `CLONE AS` creates copies of the source's tables, views and dictionaries, with their data.
+        if (create.is_clone_as)
+        {
+            required_access.emplace_back(AccessType::SELECT | AccessType::SHOW_TABLES | AccessType::SHOW_DICTIONARIES, create.as_database);
+            required_access.emplace_back(
+                AccessType::CREATE_TABLE | AccessType::CREATE_VIEW | AccessType::CREATE_DICTIONARY, create.getDatabase());
+        }
     }
     else if (create.is_dictionary)
     {

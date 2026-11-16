@@ -1,0 +1,74 @@
+CREATE DATABASE b CLONE AS a
+CREATE DATABASE IF NOT EXISTS b CLONE AS `a-b`
+CREATE DATABASE b CLONE AS a
+the clone is an ordinary Atomic database
+Atomic	Atomic
+dict	Dictionary
+dict_source	MergeTree
+j	Join
+log	Log
+mem	Memory
+mt	MergeTree
+mut	MergeTree
+mv_inner	MaterializedView
+mv_target	MergeTree
+mv_to	MaterializedView
+s	Set
+stripelog	StripeLog
+tinylog	TinyLog
+upd	MergeTree
+v	View
+1
+0
+the data
+21	290
+1
+1
+21	290
+1
+2
+3
+4
+5
+1	0
+7	seven
+8
+one
+0	2
+1	2
+2	0
+3	0
+4	0
+the pending mutation is applied in the clone, not in the source
+5
+0
+writes to the clone go to the clone
+22	1290
+2
+2
+22	1290
+two
+21	290
+1
+1
+3
+none
+writes to the source stay in the source, also after its parts merge
+17	2280
+22	1290
+the clone is the same after it is detached and attached
+22	1290
+2
+1
+2
+3
+9
+a clone of the clone
+22	1290
+3
+2
+dropping the clone leaves the source
+17	2280
+3
+unsupported engines are refused, and leave nothing behind
+0

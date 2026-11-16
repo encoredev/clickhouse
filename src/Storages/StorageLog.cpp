@@ -1320,6 +1320,19 @@ void StorageLog::backupData(BackupEntriesCollector & backup_entries_collector, c
     }
 }
 
+void StorageLog::cloneDataToPath(const String & dst_relative_data_path, ContextPtr local_context)
+{
+    /// Inserts append to the files in place, so they are copied, while no insert runs: the sizes in `sizes.json`
+    /// then agree with the files.
+    ReadLock lock{rwlock, getLockTimeout(local_context)};
+    if (!lock)
+        throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Lock timeout exceeded");
+
+    disk->createDirectories(dst_relative_data_path);
+    disk->copyDirectoryContent(
+        table_path, disk, dst_relative_data_path, local_context->getReadSettings(), local_context->getWriteSettings(), /* cancellation_hook= */ {});
+}
+
 void StorageLog::restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
 {
     auto backup = restorer.getBackup();

@@ -23,6 +23,7 @@
 #include <Formats/FormatSchemaInfo.h>
 #include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
 #include <Functions/pointInPolygon.h>
+#include <Interpreters/ServerBranch.h>
 #include <Interpreters/ActionLocksManager.h>
 #include <Interpreters/AsynchronousInsertQueue.h>
 #include <Interpreters/AsynchronousMetricLog.h>
@@ -1221,6 +1222,12 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->checkAccess(AccessType::SYSTEM_UNFREEZE);
             /// The result contains information about deleted parts as a table. It is for compatibility with ALTER TABLE UNFREEZE query.
             result = Unfreezer(getContext()).systemUnfreeze(query.backup_name);
+            break;
+        }
+        case Type::BRANCH:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_BRANCH);
+            branchServer(query.branch_path, getContext());
             break;
         }
         case Type::DISABLE_ALL_FAILPOINTS:
@@ -3306,6 +3313,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::UNFREEZE:
         {
             required_access.emplace_back(AccessType::SYSTEM_UNFREEZE);
+            break;
+        }
+        case Type::BRANCH:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_BRANCH);
             break;
         }
         case Type::SYNC_FILE_CACHE:

@@ -1,0 +1,15 @@
+SYSTEM BRANCH TO \'/some/path\'
+SYSTEM BRANCH TO \'/some/path\'
+the target must not exist, and must be absolute
+FILE_ALREADY_EXISTS
+BAD_ARGUMENTS
+the source carries on
+102	7950
+the branch has the tables as they were, with the same UUIDs
+101	5950
+1
+1
+102	8950
+same UUID
+writes to the branch stay in the branch
+102	7950

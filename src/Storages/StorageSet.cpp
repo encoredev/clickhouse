@@ -298,6 +298,18 @@ void StorageSet::truncate(const ASTPtr &, const StorageMetadataPtr & metadata_sn
 }
 
 
+void StorageSetOrJoinBase::cloneDataToPath(const String & dst_relative_data_path, ContextPtr /*local_context*/)
+{
+    /// Each insert writes a file of its own under `tmp/` and renames it into place, and nothing writes to it
+    /// afterwards, so the files are linked. `restore` reads them only if `tmp/` exists.
+    disk->createDirectories(fs::path(dst_relative_data_path) / "tmp");
+    for (auto it = disk->iterateDirectory(path); it->isValid(); it->next())
+    {
+        if (endsWith(it->name(), ".bin") && disk->existsFile(it->path()))
+            disk->createHardLink(it->path(), fs::path(dst_relative_data_path) / it->name());
+    }
+}
+
 void StorageSetOrJoinBase::restore()
 {
     if (!disk->existsDirectory(fs::path(path) / "tmp"))
