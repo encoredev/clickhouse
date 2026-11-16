@@ -186,7 +186,7 @@ CopiedDatabaseTables copyDatabaseTables(const DatabasePtr & source, const Databa
             {
                 for (const auto & table_data_path : table->getDataPaths())
                 {
-                    if (!fs::path(table_data_path).lexically_normal().string().starts_with(target.required_data_root))
+                    if (!fs::weakly_canonical(table_data_path).string().starts_with(target.required_data_root))
                         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                             "Cannot copy table {}.{}: its data at {} is outside the server's data directory {}",
                             backQuoteIfNeed(source_name), backQuoteIfNeed(name), table_data_path, target.required_data_root);
