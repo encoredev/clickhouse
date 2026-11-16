@@ -5,17 +5,22 @@
 #                  [--no-check] <output dir>
 #
 # The targets are linux-amd64, linux-arm64, darwin-amd64 and darwin-arm64,
-# the host's platform by default. A Linux target must have the host's
-# architecture; either macOS target builds on any host, cross-compiled as
-# ClickHouse's own macOS builds are.
+# the host's platform by default.
 #
-# The build runs in ClickHouse's CI image, clickhouse/binary-builder, at the
-# tag ClickHouse's CI computes for this checkout (ci/praktika), and with the
-# options of ClickHouse's single-binary builds: its pinned clang, the sysroot
-# that makes the Linux binary run on old versions of glibc, and for macOS,
-# cctools and the macOS 11 SDK. The output holds bin/clickhouse, the stripped
-# binary that is the server, the client and clickhouse-local; LICENSE; and a
-# VERSION file of key=value lines:
+# - A Linux target builds in Docker, on a host of its architecture, in
+#   ClickHouse's CI image, clickhouse/binary-builder, at the tag ClickHouse's
+#   CI computes for this checkout (ci/praktika). Its options are those of
+#   ClickHouse's single-binary builds: its pinned clang, and the sysroot that
+#   makes the binary run on old versions of glibc.
+# - A macOS target builds on a Mac, with Homebrew's LLVM, against the Mac's
+#   own SDK: darwin-arm64 on Apple Silicon, darwin-amd64 on an Intel Mac or,
+#   cross-compiled, on Apple Silicon. Apple's SDK may only be used on Apple
+#   hardware, so the macOS builds aren't cross-compiled on Linux, as
+#   ClickHouse's own are.
+#
+# The output holds bin/clickhouse, the stripped binary that is the server,
+# the client and clickhouse-local; LICENSE; and a VERSION file of key=value
+# lines:
 #
 #   version             <ClickHouse version>-<12 characters of the commit>
 #   clickhouse_version  the ClickHouse version, as in
@@ -23,10 +28,12 @@
 #   commit              the commit built
 #
 # Unless given --no-check, encore/check.sh checks the output where the host
-# can run it: a server on a copy of it clones a database and branches.
+# can run it, darwin-amd64 on Apple Silicon only where Rosetta runs it: a
+# server on a copy of it clones a database and branches.
 #
-# Needs Docker, python3, and the submodules checked out
-# (contrib/update-submodules.sh). The build directory, build/encore-<target>
+# Needs the submodules checked out (contrib/update-submodules.sh) and
+# python3; for Linux, Docker; for macOS, Homebrew's llvm@21, lld@21, cmake,
+# ninja, nasm, findutils and grep. The build directory, build/encore-<target>
 # by default, is kept, so that a second build is incremental.
 set -euo pipefail
 
@@ -34,6 +41,9 @@ usage() {
 	sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
 	exit 2
 }
+
+# The LLVM the macOS builds use; cmake/tools.cmake gives the minimum.
+llvm_version=21
 
 src=$(cd "$(dirname "$0")/.." && pwd)
 target=
@@ -72,17 +82,21 @@ arch=${target#*-}
 case $target in
 	linux-amd64|linux-arm64)
 		if [ "$arch" != "$host_arch" ]; then
-			echo "can't build $target on $host: a Linux target needs the host's architecture" >&2
+			echo "can't build $target on $host: a Linux target needs a host of its architecture" >&2
 			exit 1
 		fi
 		;;
-	darwin-amd64|darwin-arm64) ;;
+	darwin-amd64|darwin-arm64)
+		if [ "$host_os" != darwin ]; then
+			echo "can't build $target on $host: a macOS target builds on a Mac" >&2
+			exit 1
+		fi
+		if [ "$target" != "$host" ] && [ "$target" != darwin-amd64 ]; then
+			echo "can't build $target on $host: only darwin-amd64 is cross-compiled, on Apple Silicon" >&2
+			exit 1
+		fi
+		;;
 	*) echo "unsupported target $target" >&2; exit 1 ;;
-esac
-
-case $arch in
-	amd64) cmake_arch=x86_64 ;;
-	arm64) cmake_arch=aarch64 ;;
 esac
 
 if [ ! -e "$src/contrib/zstd/lib/zstd.h" ]; then
@@ -105,9 +119,36 @@ if [[ ! $clickhouse_version =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
 fi
 version=$clickhouse_version-${commit:0:12}
 
-# The tag of clickhouse/binary-builder that ClickHouse's CI builds this
-# checkout with: a digest of the image's Dockerfile and those it depends on.
-image_tag=$(cd "$src" && python3 - <<'EOF'
+build=${build:-$src/build/encore-$target}
+mkdir -p "$build" "$out"
+build=$(cd "$build" && pwd)
+out=$(cd "$out" && pwd)
+
+# The options of ClickHouse's single-binary builds that don't depend on the
+# platform
+cmake_options=(
+	-G Ninja
+	-DCMAKE_BUILD_TYPE=None
+	-DENABLE_THINLTO=0
+	-DSANITIZE=
+	-DBUILD_STRIPPED_BINARY=1
+	-DENABLE_CLICKHOUSE_SELF_EXTRACTING=0
+	-DCOMPILER_CACHE=disabled
+	-DENABLE_TESTS=0
+	-DENABLE_UTILS=0
+	-DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON
+)
+
+build_linux() {
+	local cmake_arch image_tag image
+	case $arch in
+		amd64) cmake_arch=x86_64 ;;
+		arm64) cmake_arch=aarch64 ;;
+	esac
+
+	# The tag of clickhouse/binary-builder that ClickHouse's CI builds this
+	# checkout with: a digest of the image's Dockerfile and those it depends on.
+	image_tag=$(cd "$src" && python3 - <<'EOF'
 import contextlib, io, sys
 sys.path[:0] = [".", "ci"]
 from ci.defs.defs import DOCKERS
@@ -117,61 +158,65 @@ with contextlib.redirect_stdout(io.StringIO()):
     digest = Digest().calc_docker_digest(config, DOCKERS)
 print(digest)
 EOF
-)
-image=clickhouse/binary-builder:$image_tag
-echo "building ClickHouse $version for $target in $image"
-
-build=${build:-$src/build/encore-$target}
-mkdir -p "$build" "$out"
-build=$(cd "$build" && pwd)
-out=$(cd "$out" && pwd)
-
-cmake_options=(
-	-G Ninja
-	-DCMAKE_BUILD_TYPE=None
-	-DENABLE_THINLTO=0
-	-DSANITIZE=
-	-DBUILD_STRIPPED_BINARY=1
-	-DENABLE_CLICKHOUSE_SELF_EXTRACTING=0
-	-DCMAKE_C_COMPILER=clang-23
-	-DCMAKE_CXX_COMPILER=clang++-23
-	-DCOMPILER_CACHE=disabled
-	-DCMAKE_TOOLCHAIN_FILE=/src/cmake/$os/toolchain-$cmake_arch.cmake
-	-DENABLE_TESTS=0
-	-DENABLE_UTILS=0
-	-DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON
-)
-if [ "$os" = darwin ]; then
-	# The image keeps the macOS SDK in /build/cmake/toolchain, where the
-	# toolchain files look for it in the source tree.
-	mkdir -p "$src/cmake/toolchain"
-	ln -sfn /build/cmake/toolchain/darwin-x86_64 "$src/cmake/toolchain/darwin-x86_64"
-	ln -sfn /build/cmake/toolchain/darwin-x86_64 "$src/cmake/toolchain/darwin-aarch64"
-	cctools=/cctools/bin/$cmake_arch-apple-darwin
-	cmake_options+=(
-		"-DCMAKE_AR:FILEPATH=$cctools-ar"
-		"-DCMAKE_INSTALL_NAME_TOOL=$cctools-install_name_tool"
-		"-DCMAKE_RANLIB:FILEPATH=$cctools-ranlib"
-		"-DLINKER_NAME=$cctools-ld"
 	)
-fi
+	image=clickhouse/binary-builder:$image_tag
+	echo "building ClickHouse $version for $target in $image"
 
-# As the host's user, so that the build and the output belong to it.
-docker run --rm \
-	--platform "linux/$host_arch" \
-	--user "$(id -u):$(id -g)" \
-	--env HOME=/tmp/home \
-	--volume "$src:/src" \
-	--volume "$build:/ch-build" \
-	"$image" \
-	bash -euo pipefail -c '
-		mkdir -p "$HOME"
-		# The checkout belongs to the host user, whom git in the container
-		# does not know; the build asks git for the list of licenses.
-		git config --global --add safe.directory /src
-		cmake -S /src -B /ch-build "$@"
-		ninja -C /ch-build clickhouse-stripped
-	' bash "${cmake_options[@]}"
+	cmake_options+=(
+		-DCMAKE_C_COMPILER=clang-23
+		-DCMAKE_CXX_COMPILER=clang++-23
+		"-DCMAKE_TOOLCHAIN_FILE=/src/cmake/linux/toolchain-$cmake_arch.cmake"
+	)
+
+	# As the host's user, so that the build and the output belong to it.
+	docker run --rm \
+		--platform "linux/$host_arch" \
+		--user "$(id -u):$(id -g)" \
+		--env HOME=/tmp/home \
+		--volume "$src:/src" \
+		--volume "$build:/ch-build" \
+		"$image" \
+		bash -euo pipefail -c '
+			mkdir -p "$HOME"
+			# The checkout belongs to the host user, whom git in the container
+			# does not know; the build asks git for the list of licenses.
+			git config --global --add safe.directory /src
+			cmake -S /src -B /ch-build "$@"
+			ninja -C /ch-build clickhouse-stripped
+		' bash "${cmake_options[@]}"
+}
+
+build_darwin() {
+	local llvm lld
+	llvm=$(brew --prefix "llvm@$llvm_version")
+	lld=$(brew --prefix "lld@$llvm_version")
+	echo "building ClickHouse $version for $target with $("$llvm/bin/clang" --version | head -1)"
+
+	cmake_options+=(
+		"-DCMAKE_C_COMPILER=$llvm/bin/clang"
+		"-DCMAKE_CXX_COMPILER=$llvm/bin/clang++"
+		"-DCMAKE_AR=$llvm/bin/llvm-ar"
+		# Its Rust needs a pinned nightly toolchain, and Encore uses none of
+		# what it builds.
+		-DENABLE_RUST=OFF
+	)
+	if [ "$target" != "$host" ]; then
+		# ClickHouse's toolchain file for Intel Macs, which takes the SDK from
+		# cmake/toolchain/darwin-x86_64, where its README says to unpack one:
+		# the Mac's own, linked entry by entry next to the README.
+		local sdk entry
+		sdk=$(xcrun --sdk macosx --show-sdk-path)
+		for entry in "$sdk"/*; do
+			ln -sfn "$entry" "$src/cmake/toolchain/darwin-x86_64/$(basename "$entry")"
+		done
+		cmake_options+=("-DCMAKE_TOOLCHAIN_FILE=$src/cmake/darwin/toolchain-x86_64.cmake")
+	fi
+
+	PATH="$llvm/bin:$lld/bin:$PATH" cmake -S "$src" -B "$build" "${cmake_options[@]}"
+	PATH="$llvm/bin:$lld/bin:$PATH" ninja -C "$build" clickhouse-stripped
+}
+
+"build_$os"
 
 rm -rf "$out/bin"
 mkdir -p "$out/bin"
@@ -185,7 +230,7 @@ commit=$commit
 EOF
 
 if [ -n "$check" ]; then
-	if [ "$target" = "$host" ]; then
+	if [ "$target" = "$host" ] || { [ "$target" = darwin-amd64 ] && arch -x86_64 /usr/bin/true 2>/dev/null; }; then
 		"$src/encore/check.sh" "$out"
 	else
 		echo "not checking $target on $host"
