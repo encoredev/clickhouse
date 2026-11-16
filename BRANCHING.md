@@ -229,20 +229,27 @@ tests/clickhouse-test 05813_create_database_clone_as 05814_system_branch
 ### The build Encore bundles
 
 `encore/dist.sh --target <os>-<arch> <output dir>` builds the binary Encore
-runs, for `linux-amd64`, `linux-arm64`, `darwin-amd64` or `darwin-arm64`. It
-builds in ClickHouse's own CI image, `clickhouse/binary-builder`, at the tag
-ClickHouse's CI computes for the checkout, with the options of ClickHouse's
-single-binary builds: its pinned clang, the sysroot that makes the Linux
-binary run on old versions of glibc, and for macOS, cross-compilation with
-`cctools` and the macOS 11 SDK. So it needs Docker and Python on the host,
-and the submodules (`contrib/update-submodules.sh`); a Linux target needs a
-host of its architecture. The output holds `bin/clickhouse` (stripped, not
-self-extracting), `LICENSE`, and a `VERSION` file, whose `version=` line is
-the ClickHouse version and 12 characters of the commit.
+runs, for `linux-amd64`, `linux-arm64`, `darwin-amd64` or `darwin-arm64`:
+
+- **Linux** builds in Docker, on a host of the target's architecture, in
+  ClickHouse's own CI image, `clickhouse/binary-builder`, at the tag
+  ClickHouse's CI computes for the checkout, with the options of ClickHouse's
+  single-binary builds: its pinned clang, and the sysroot that makes the
+  binary run on old versions of glibc.
+- **macOS** builds on a Mac, with Homebrew's LLVM, against the Mac's own SDK:
+  `darwin-amd64` is cross-compiled on Apple Silicon with ClickHouse's
+  toolchain file. Apple's SDK may only be used on Apple hardware, so unlike
+  ClickHouse's own macOS builds, these aren't cross-compiled on Linux.
+
+The submodules must be checked out (`contrib/update-submodules.sh`). The
+output holds `bin/clickhouse` (stripped, not self-extracting), `LICENSE`, and
+a `VERSION` file, whose `version=` line is the ClickHouse version and 12
+characters of the commit.
 
 `encore/check.sh <output dir>` checks a build where it runs: a server on a
 copy of it clones a database and branches, and `clickhouse local` reads the
-branch. `dist.sh` runs it when the host can run the build.
+branch. `dist.sh` runs it when the host can run the build: `darwin-amd64` on Apple
+Silicon where Rosetta is installed.
 
 Encore's releaser builds the four platforms in GitHub Actions and publishes
 them to `encore-releases2` as `encore-clickhouse/<version>/<os>-<arch>.tar.gz`,
