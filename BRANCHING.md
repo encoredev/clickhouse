@@ -206,6 +206,9 @@ in the server log.
   metadata is written; the small files copied with them (mutations,
   `format_version.txt`) are not.
 - **Detached tables** are not copied.
+- **`clickhouse local` can't branch.** Its `default` database is an
+  `Overlay` of an `Atomic` database and the file system, which `SYSTEM BRANCH`
+  refuses. It reads a branch fine.
 
 ## Building and testing
 
@@ -222,3 +225,26 @@ tests/clickhouse-test 05813_create_database_clone_as 05814_system_branch
   parameter.
 - `05814_system_branch`: branching a running server and reading the branch
   with `clickhouse-local`.
+
+### The build Encore bundles
+
+`encore/dist.sh --target <os>-<arch> <output dir>` builds the binary Encore
+runs, for `linux-amd64`, `linux-arm64`, `darwin-amd64` or `darwin-arm64`. It
+builds in ClickHouse's own CI image, `clickhouse/binary-builder`, at the tag
+ClickHouse's CI computes for the checkout, with the options of ClickHouse's
+single-binary builds: its pinned clang, the sysroot that makes the Linux
+binary run on old versions of glibc, and for macOS, cross-compilation with
+`cctools` and the macOS 11 SDK. So it needs Docker and Python on the host,
+and the submodules (`contrib/update-submodules.sh`); a Linux target needs a
+host of its architecture. The output holds `bin/clickhouse` (stripped, not
+self-extracting), `LICENSE`, and a `VERSION` file, whose `version=` line is
+the ClickHouse version and 12 characters of the commit.
+
+`encore/check.sh <output dir>` checks a build where it runs: a server on a
+copy of it clones a database and branches, and `clickhouse local` reads the
+branch. `dist.sh` runs it when the host can run the build.
+
+Encore's releaser builds the four platforms in GitHub Actions and publishes
+them to `encore-releases2` as `encore-clickhouse/<version>/<os>-<arch>.tar.gz`,
+as `cmd/clickhouse` and `.github/workflows/clickhouse.yml` in
+`encoredev/releaser` describe.
