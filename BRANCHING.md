@@ -54,8 +54,8 @@ dictionary loads from them. The tables get new UUIDs.
   `CREATE DICTIONARY` on the new database, and `SELECT`, `SHOW TABLES` and
   `SHOW DICTIONARIES` on the source. `ON CLUSTER` is not supported.
 
-**Prepare templates with `OPTIMIZE TABLE ... FINAL`.** A clone links each
-part of each table. A table merged into one part per partition links fewer
+**Prepare templates with `OPTIMIZE TABLE ... FINAL`.** A clone copies each
+part of each table. A table merged into one part per partition copies fewer
 files, and its clones have no merges to do, which would write their own copy
 of the data.
 
@@ -108,7 +108,7 @@ on it has them as after a restart. Give it ports of its own.
 
 | Engine | How |
 |---|---|
-| `MergeTree` family, not replicated | Each active part, including the patch parts of lightweight updates, is hard-linked as `ALTER TABLE ... FREEZE` links it, with the pending mutations. The deduplication log is not copied. |
+| `MergeTree` family, not replicated | Each active part, including the patch parts of lightweight updates, is cloned with `clonefile` on APFS, and elsewhere hard-linked as `ALTER TABLE ... FREEZE` links it, with the pending mutations. The deduplication log is not copied. |
 | `Log`, `TinyLog`, `StripeLog` | The files are copied, while no insert runs: inserts append to them in place. |
 | `Set`, `Join` | The files are hard-linked: each insert writes a file of its own. |
 | `Memory` | The clone shares the source's blocks. A branch's `Memory` tables are empty, as after a restart. |
@@ -119,11 +119,16 @@ on it has them as after a restart. Give it ports of its own.
 
 MergeTree tables never change a part once it is written: an insert writes a
 new part, and merges and mutations write new parts that replace old ones. So
-a part can be shared by hard link, which is how `ALTER TABLE ... FREEZE`,
-`ATTACH PARTITION ... FROM` and `CREATE TABLE ... CLONE AS` already copy them.
-Linking makes the part's files read-only, so that nothing writes to them in
-place. Deleting a part removes its names; the space comes back when the last
-name of each file is gone.
+a part can be shared rather than copied:
+
+- **On APFS (macOS)**, a part's directory is cloned with one call to
+  `clonefile`. The clone's files share their data with the originals until
+  either is written, and are independent files from the start.
+- **Elsewhere**, a part's files are hard-linked, which is how `ALTER TABLE ...
+  FREEZE`, `ATTACH PARTITION ... FROM` and `CREATE TABLE ... CLONE AS` already
+  copy them. Linking makes the part's files read-only, so that nothing writes
+  to them in place. Deleting a part removes its names; the space comes back
+  when the last name of each file is gone.
 
 Both statements go through `copyDatabaseTables` (`src/Databases/DatabaseCopy.cpp`):
 
@@ -136,6 +141,9 @@ Both statements go through `copyDatabaseTables` (`src/Databases/DatabaseCopy.cpp
    database's metadata directory.
 3. It copies the table's data with `IStorage::cloneDataToPath`, into the
    directory the new table will have: `store/<xxx>/<uuid>/`.
+
+Tables that can't be copied are refused before anything is written. The
+tables are then copied in parallel, on up to `max_threads` threads.
 
 `CREATE DATABASE ... CLONE AS` then creates the database as any `CREATE
 DATABASE`, and loads its tables as the server loads a database when it starts.
@@ -150,29 +158,48 @@ collection directories, and renames the staging directory to the target.
 ## Performance
 
 Release build, macOS on Apple Silicon (APFS), measured with the client's
-`--time`, five runs each. The database: one `MergeTree` table merged into
-3 parts, a materialized view with an inner table, and 20 small `MergeTree`
-tables, 25 parts in all.
+`--time` on a machine with other load, medians of 30 runs (12 for the
+branch) over three rounds that alternate server restarts.
 
-| Data | `CREATE DATABASE ... CLONE AS` |
-|---|---|
-| 91 MiB | 83 to 88 ms |
-| 1.09 GiB | 85 to 143 ms (median 88 ms) |
+The templates:
 
-`SYSTEM BRANCH` of that server (eight databases, 1.1 GiB) took 0.20 to
-0.37 s. Three branches of it took 780 KiB of disk beyond the original.
+- **Freshly migrated:** 20 `MergeTree` tables and 2 materialized views, all
+  empty, as a template is right after its migrations: no parts.
+- **Seeded:** the same, with 1,000 rows in each table: 22 parts.
+- **1.09 GiB:** one `MergeTree` table of 50 million rows merged into a few
+  parts, a materialized view, and 20 small tables: 26 parts.
 
-Fifteen clones taken while inserts ran into the source all succeeded, with
-the row counts of the moment each was taken, and no errors in the server log.
+| | Hard links, one table at a time | Hard links, parallel | `clonefile`, one table at a time | `clonefile`, parallel |
+|---|---|---|---|---|
+| Clone the freshly migrated template | 12.5 ms | 11.5 ms | 12.0 ms | 10.0 ms |
+| Clone the seeded template | 83.5 ms | 47.5 ms | 21.0 ms | 16.5 ms |
+| Clone the 1.09 GiB database | 113.5 ms | 81.5 ms | 22.0 ms | 17.5 ms |
+| `SYSTEM BRANCH` of the server (1.1 GiB) | 213.5 ms | 105.5 ms | 40.5 ms | 27.0 ms |
 
+The last column is what macOS gets; Linux gets the second. A clone's time
+grows with the number of parts, and with hard links with the number of
+files in them, not with the size of the data. With hard links, each file
+costs about 0.2 ms on macOS.
+
+Syncing the cloned parts' directories costs about 10% of a clone with hard
+links; `fsync_metadata`, which syncs the copied definitions, costs nothing
+measurable.
+
+Three branches of the 1.1 GiB server took 780 KiB of disk beyond the
+original. Fifteen clones taken while inserts ran into the source all
+succeeded, with the row counts of the moment each was taken, and no errors
+in the server log.
+
+## Limitations
 
 - **Prototype.** It has run on macOS (APFS) only.
 - **Space.** After a merge or a mutation on either side, the merged data is
-  stored twice: once for each side.
-- **Linking costs per file.** A clone links every file of every part, and
-  fsyncs each part's directory; wide parts have two files per column, so the
-  time grows with the number of parts and columns rather than the data.
-  Templates merged with `OPTIMIZE TABLE ... FINAL` keep this small.
+  stored twice: once for each side. On APFS, `du` counts a cloned part's
+  files in full, though they share their data with the original until
+  written.
+- **The cost of a clone grows with the number of parts**, and with hard
+  links with the number of files in them: wide parts have two files per
+  column. Templates merged with `OPTIMIZE TABLE ... FINAL` keep this small.
 - **Replicated databases and tables** are refused, as are the other engines
   listed in [What is copied](#what-is-copied).
 - **Durability.** The parts' directories are synced before the clone's

@@ -45,6 +45,7 @@ namespace DB
     M(CONCURRENT_JOIN, "ConcurrentJoin") \
     M(CREATE_TABLES, "CreateTables") \
     M(DATABASE_BACKUP, "DatabaseBackup") \
+    M(DATABASE_COPY, "DatabaseCopy") \
     M(DATABASE_ON_DISK, "DatabaseOnDisk") \
     M(DATABASE_REPLICAS, "DBReplicas") \
     M(DATALAKE_REST_CATALOG, "RestCatalog") \
