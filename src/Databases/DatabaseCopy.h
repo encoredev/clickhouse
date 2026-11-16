@@ -31,8 +31,8 @@ struct DatabaseCopyTarget
     /// for a branch.
     String data_path_prefix;
 
-    /// If set, the data of every table copied with its data must be under this directory: a branch copies into a
-    /// directory of the server's data directory, so the data must be on a disk there.
+    /// If set, the data of every table copied with its data must be under this directory, a canonical path: a branch
+    /// copies into a directory of the server's data directory, so the data must be on a disk there.
     String required_data_root;
 };
 
