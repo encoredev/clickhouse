@@ -1,6 +1,10 @@
 #include <Databases/DatabaseCopy.h>
 
+#include <Common/CurrentMetrics.h>
+#include <Common/ThreadPool.h>
 #include <Common/escapeForFileName.h>
+#include <Common/setThreadName.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
 #include <Core/Settings.h>
@@ -22,6 +26,13 @@
 
 namespace fs = std::filesystem;
 
+namespace CurrentMetrics
+{
+    extern const Metric DatabaseCopyThreads;
+    extern const Metric DatabaseCopyThreadsActive;
+    extern const Metric DatabaseCopyThreadsScheduled;
+}
+
 namespace DB
 {
 
@@ -29,6 +40,7 @@ namespace Setting
 {
     extern const SettingsBool fsync_metadata;
     extern const SettingsSeconds lock_acquire_timeout;
+    extern const SettingsMaxThreads max_threads;
 }
 
 namespace ErrorCodes
@@ -137,86 +149,130 @@ CopiedDatabaseTables copyDatabaseTables(const DatabasePtr & source, const Databa
         new_uuids.emplace(uuid, target.new_uuids ? UUIDHelpers::generateV4() : uuid);
     }
 
+    /// What is done to each table, decided before anything is written, so that a table that can't be copied
+    /// is refused before any is.
+    struct TableToCopy
+    {
+        String name;
+        StoragePtr table;
+        TableCopyKind kind;
+        UUID new_uuid;
+        String name_in_copy;
+        String data_path;
+    };
+
     CopiedDatabaseTables copied;
+    std::vector<TableToCopy> tables_to_copy;
+    for (const auto & [name, table] : tables)
+    {
+        const auto kind = getTableCopyKind(*table);
+        if (!kind)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Cannot copy table {}.{}: copying tables with the engine {} is not supported",
+                backQuoteIfNeed(source_name), backQuoteIfNeed(name), table->getName());
+
+        TableToCopy table_to_copy{
+            .name = name,
+            .table = table,
+            .kind = *kind,
+            .new_uuid = new_uuids.at(table->getStorageID().uuid),
+            .name_in_copy = target.new_uuids ? getInnerTableNameInCopy(name, new_uuids) : name,
+            .data_path = {},
+        };
+
+        if (*kind == TableCopyKind::Data)
+        {
+            if (!target.required_data_root.empty())
+            {
+                for (const auto & table_data_path : table->getDataPaths())
+                {
+                    if (!fs::path(table_data_path).lexically_normal().string().starts_with(target.required_data_root))
+                        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                            "Cannot copy table {}.{}: its data at {} is outside the server's data directory {}",
+                            backQuoteIfNeed(source_name), backQuoteIfNeed(name), table_data_path, target.required_data_root);
+                }
+            }
+
+            table_to_copy.data_path
+                = fs::path(target.data_path_prefix) / DatabaseCatalog::getStoreDirPath() / DatabaseCatalog::getPathForUUID(table_to_copy.new_uuid);
+            copied.data_paths.push_back(table_to_copy.data_path);
+        }
+        else if (*kind == TableCopyKind::Memory)
+        {
+            copied.memory_tables.emplace_back(table_to_copy.name_in_copy, table);
+        }
+
+        if (target.new_uuids)
+            copied.uuid_locks.emplace_back(table_to_copy.new_uuid);
+
+        tables_to_copy.push_back(std::move(table_to_copy));
+    }
+
+    auto copy_table = [&](const TableToCopy & table_to_copy)
+    {
+        const auto & table = table_to_copy.table;
+
+        /// The definition and the data are taken under the alter lock, so that they agree. The shared lock
+        /// keeps the table from being truncated meanwhile.
+        auto table_lock = table->lockForShare(context->getCurrentQueryId(), lock_timeout);
+        auto alter_lock = table->lockForAlter(lock_timeout);
+
+        ASTPtr ast = DatabaseOnDisk::parseQueryFromMetadata(log, context, db_disk, source->getObjectMetadataPath(table_to_copy.name));
+        auto & create = ast->as<ASTCreateQuery &>();
+
+        if (target.new_uuids)
+        {
+            CreateQueryUUIDs uuids(create);
+            uuids.uuid = table_to_copy.new_uuid;
+            for (auto & [target_kind, inner_uuid] : uuids.targets_inner_uuids)
+            {
+                if (inner_uuid == UUIDHelpers::Nil)
+                    continue;
+                auto it = new_uuids.find(inner_uuid);
+                if (it == new_uuids.end())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Cannot copy table {}.{}: its inner table with UUID {} is not in the database",
+                        backQuoteIfNeed(source_name), backQuoteIfNeed(table_to_copy.name), inner_uuid);
+                inner_uuid = it->second;
+            }
+            uuids.copyToQuery(create);
+        }
+
+        if (target.database_name != source_name)
+        {
+            DDLRenamingMap renaming_map;
+            renaming_map.setNewDatabaseName(source_name, target.database_name);
+            renameDatabaseAndTableNameInCreateQuery(ast, renaming_map, context->getGlobalContext());
+        }
+
+        if (table_to_copy.kind == TableCopyKind::Data)
+            table->cloneDataToPath(table_to_copy.data_path, context);
+
+        writeMetadataFile(
+            db_disk,
+            fs::path(target.metadata_path) / (escapeForFileName(table_to_copy.name_in_copy) + ".sql"),
+            getObjectDefinitionFromCreateQuery(ast),
+            settings[Setting::fsync_metadata]);
+
+        LOG_DEBUG(log, "Copied table {}.{} as {}",
+            backQuoteIfNeed(source_name), backQuoteIfNeed(table_to_copy.name), backQuoteIfNeed(table_to_copy.name_in_copy));
+    };
+
     try
     {
         db_disk->createDirectories(target.metadata_path);
 
-        for (const auto & [name, table] : tables)
-        {
-            const auto kind = getTableCopyKind(*table);
-            if (!kind)
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                    "Cannot copy table {}.{}: copying tables with the engine {} is not supported",
-                    backQuoteIfNeed(source_name), backQuoteIfNeed(name), table->getName());
-
-            /// The definition and the data are taken under the alter lock, so that they agree. The shared lock
-            /// keeps the table from being truncated meanwhile.
-            auto table_lock = table->lockForShare(context->getCurrentQueryId(), lock_timeout);
-            auto alter_lock = table->lockForAlter(lock_timeout);
-
-            ASTPtr ast = DatabaseOnDisk::parseQueryFromMetadata(log, context, db_disk, source->getObjectMetadataPath(name));
-            auto & create = ast->as<ASTCreateQuery &>();
-
-            const UUID new_uuid = new_uuids.at(table->getStorageID().uuid);
-            String name_in_copy = name;
-            if (target.new_uuids)
-            {
-                CreateQueryUUIDs uuids(create);
-                uuids.uuid = new_uuid;
-                for (auto & [target_kind, inner_uuid] : uuids.targets_inner_uuids)
-                {
-                    if (inner_uuid == UUIDHelpers::Nil)
-                        continue;
-                    auto it = new_uuids.find(inner_uuid);
-                    if (it == new_uuids.end())
-                        throw Exception(ErrorCodes::LOGICAL_ERROR,
-                            "Cannot copy table {}.{}: its inner table with UUID {} is not in the database",
-                            backQuoteIfNeed(source_name), backQuoteIfNeed(name), inner_uuid);
-                    inner_uuid = it->second;
-                }
-                uuids.copyToQuery(create);
-                name_in_copy = getInnerTableNameInCopy(name, new_uuids);
-                copied.uuid_locks.emplace_back(new_uuid);
-            }
-
-            if (target.database_name != source_name)
-            {
-                DDLRenamingMap renaming_map;
-                renaming_map.setNewDatabaseName(source_name, target.database_name);
-                renameDatabaseAndTableNameInCreateQuery(ast, renaming_map, context->getGlobalContext());
-            }
-
-            if (*kind == TableCopyKind::Data)
-            {
-                if (!target.required_data_root.empty())
-                {
-                    for (const auto & table_data_path : table->getDataPaths())
-                    {
-                        if (!fs::path(table_data_path).lexically_normal().string().starts_with(target.required_data_root))
-                            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                                "Cannot copy table {}.{}: its data at {} is outside the server's data directory {}",
-                                backQuoteIfNeed(source_name), backQuoteIfNeed(name), table_data_path, target.required_data_root);
-                    }
-                }
-
-                const String data_path = fs::path(target.data_path_prefix) / DatabaseCatalog::getStoreDirPath() / DatabaseCatalog::getPathForUUID(new_uuid);
-                copied.data_paths.push_back(data_path);
-                table->cloneDataToPath(data_path, context);
-            }
-            else if (*kind == TableCopyKind::Memory)
-            {
-                copied.memory_tables.emplace_back(name_in_copy, table);
-            }
-
-            writeMetadataFile(
-                db_disk,
-                fs::path(target.metadata_path) / (escapeForFileName(name_in_copy) + ".sql"),
-                getObjectDefinitionFromCreateQuery(ast),
-                settings[Setting::fsync_metadata]);
-
-            LOG_DEBUG(log, "Copied table {}.{} as {}", backQuoteIfNeed(source_name), backQuoteIfNeed(name), backQuoteIfNeed(name_in_copy));
-        }
+        /// The tables are independent of each other, and copying one is mostly waiting for the file system.
+        const size_t max_threads = settings[Setting::max_threads];
+        ThreadPool pool(
+            CurrentMetrics::DatabaseCopyThreads,
+            CurrentMetrics::DatabaseCopyThreadsActive,
+            CurrentMetrics::DatabaseCopyThreadsScheduled,
+            std::max<size_t>(1, std::min(max_threads, tables_to_copy.size())));
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::DATABASE_COPY);
+        for (const auto & table_to_copy : tables_to_copy)
+            runner.enqueueAndKeepTrack([&copy_table, &table_to_copy] { copy_table(table_to_copy); }, Priority{0});
+        runner.waitForAllToFinishAndRethrowFirstError();
     }
     catch (...)
     {
