@@ -33,7 +33,8 @@
 #
 # Needs the submodules checked out (contrib/update-submodules.sh) and
 # python3; for Linux, Docker; for macOS, Homebrew's llvm@21, lld@21, cmake,
-# ninja, nasm, findutils and grep. The build directory, build/encore-<target>
+# ninja, nasm, findutils and grep, and an SDK the checkout's libc++ supports:
+# SDKROOT, or the default one. The build directory, build/encore-<target>
 # by default, is kept, so that a second build is incremental.
 set -euo pipefail
 
@@ -187,10 +188,21 @@ EOF
 }
 
 build_darwin() {
-	local llvm lld
+	local llvm lld sdk
 	llvm=$(brew --prefix "llvm@$llvm_version")
 	lld=$(brew --prefix "lld@$llvm_version")
-	echo "building ClickHouse $version for $target with $("$llvm/bin/clang" --version | head -1)"
+	sdk=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}
+
+	# From macOS 27, the SDK's math.h includes <float.h> asking for INFINITY
+	# and NAN alone (__need_infinity_nan). The <float.h> of older versions of
+	# libc++ has an include guard that ignores such a request, so after it
+	# no <float.h> defines the other macros, and nothing compiles.
+	if [ -f "$src/contrib/llvm-project/libcxx/include/float.h" ] && grep -q __need_infinity_nan "$sdk/usr/include/math.h"; then
+		echo "the macOS SDK $sdk is too new for the libc++ of this version of ClickHouse:" >&2
+		echo "set SDKROOT to the SDK of macOS 26 or earlier" >&2
+		exit 1
+	fi
+	echo "building ClickHouse $version for $target with $("$llvm/bin/clang" --version | head -1), against $sdk"
 
 	cmake_options+=(
 		"-DCMAKE_C_COMPILER=$llvm/bin/clang"
@@ -204,12 +216,13 @@ build_darwin() {
 		# ClickHouse's toolchain file for Intel Macs, which takes the SDK from
 		# cmake/toolchain/darwin-x86_64, where its README says to unpack one:
 		# the Mac's own, linked entry by entry next to the README.
-		local sdk entry
-		sdk=$(xcrun --sdk macosx --show-sdk-path)
+		local entry
 		for entry in "$sdk"/*; do
 			ln -sfn "$entry" "$src/cmake/toolchain/darwin-x86_64/$(basename "$entry")"
 		done
 		cmake_options+=("-DCMAKE_TOOLCHAIN_FILE=$src/cmake/darwin/toolchain-x86_64.cmake")
+	else
+		cmake_options+=("-DCMAKE_OSX_SYSROOT=$sdk")
 	fi
 
 	PATH="$llvm/bin:$lld/bin:$PATH" cmake -S "$src" -B "$build" "${cmake_options[@]}"

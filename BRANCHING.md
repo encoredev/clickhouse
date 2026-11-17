@@ -239,7 +239,9 @@ runs, for `linux-amd64`, `linux-arm64`, `darwin-amd64` or `darwin-arm64`:
 - **macOS** builds on a Mac, with Homebrew's LLVM, against the Mac's own SDK:
   `darwin-amd64` is cross-compiled on Apple Silicon with ClickHouse's
   toolchain file. Apple's SDK may only be used on Apple hardware, so unlike
-  ClickHouse's own macOS builds, these aren't cross-compiled on Linux.
+  ClickHouse's own macOS builds, these aren't cross-compiled on Linux. The
+  SDK is `SDKROOT`'s, or the default one; ClickHouse 26.10's libc++ doesn't
+  build against the SDK of macOS 27, so `dist.sh` refuses it.
 
 The submodules must be checked out (`contrib/update-submodules.sh`). The
 output holds `bin/clickhouse` (stripped, not self-extracting), `LICENSE`, and
