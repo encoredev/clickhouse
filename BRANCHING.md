@@ -253,7 +253,17 @@ copy of it clones a database and branches, and `clickhouse local` reads the
 branch. `dist.sh` runs it when the host can run the build: `darwin-amd64` on Apple
 Silicon where Rosetta is installed.
 
+`encore/docker/Dockerfile` makes the image Encore runs where it runs
+ClickHouse in Docker, as on Windows, where ClickHouse doesn't run: the
+official `clickhouse/clickhouse-server` image of the same release, pinned by
+digest, with `/usr/bin/clickhouse` replaced by the Linux builds. Everything
+else is the official image's, the entrypoint and the environment variables it
+reads included. `encore/docker/check.sh <image>` runs it as a server, checks
+it reports the build's version, clones a database and branches into its data
+volume.
+
 Encore's releaser builds the four platforms in GitHub Actions and publishes
 them to `encore-releases2` as `encore-clickhouse/<version>/<os>-<arch>.tar.gz`,
-as `cmd/clickhouse` and `.github/workflows/clickhouse.yml` in
-`encoredev/releaser` describe.
+and the image to Docker Hub as `encoredotdev/clickhouse:<version>`, as
+`cmd/clickhouse` and `.github/workflows/clickhouse.yml` in `encoredev/releaser`
+describe.
