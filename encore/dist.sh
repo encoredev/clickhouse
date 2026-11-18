@@ -10,8 +10,9 @@
 # - A Linux target builds in Docker, on a host of its architecture, in
 #   ClickHouse's CI image, clickhouse/binary-builder, at the tag ClickHouse's
 #   CI computes for this checkout (ci/praktika). Its options are those of
-#   ClickHouse's single-binary builds: its pinned clang, and the sysroot that
-#   makes the binary run on old versions of glibc.
+#   ClickHouse's single-binary builds: the image's clang, which each version
+#   of ClickHouse pins, and the sysroot that makes the binary run on old
+#   versions of glibc.
 # - A macOS target builds on a Mac, with Homebrew's LLVM, against the Mac's
 #   own SDK: darwin-arm64 on Apple Silicon, darwin-amd64 on an Intel Mac or,
 #   cross-compiled, on Apple Silicon. Apple's SDK may only be used on Apple
@@ -141,17 +142,23 @@ cmake_options=(
 )
 
 build_linux() {
-	local cmake_arch image_tag image
+	local cmake_arch image_arch image_tag image
 	case $arch in
-		amd64) cmake_arch=x86_64 ;;
-		arm64) cmake_arch=aarch64 ;;
+		amd64) cmake_arch=x86_64 image_arch=amd ;;
+		arm64) cmake_arch=aarch64 image_arch=arm ;;
 	esac
 
 	# The tag of clickhouse/binary-builder that ClickHouse's CI builds this
 	# checkout with: a digest of the image's Dockerfile and those it depends on.
+	# The digest asks whether it runs in ClickHouse's CI only to decide what to
+	# print, and finding out reads the GitHub Actions context and asks the
+	# EC2 instance metadata service, with no timeout: on a runner outside
+	# AWS that takes over an hour. It's told it runs locally instead.
 	image_tag=$(cd "$src" && python3 - <<'EOF'
 import contextlib, io, sys
 sys.path[:0] = [".", "ci"]
+import ci.praktika.digest
+ci.praktika.digest._is_local_run = lambda: True
 from ci.defs.defs import DOCKERS
 from ci.praktika.digest import Digest
 config = next(d for d in DOCKERS if d.name == "clickhouse/binary-builder")
@@ -160,12 +167,14 @@ with contextlib.redirect_stdout(io.StringIO()):
 print(digest)
 EOF
 	)
-	image=clickhouse/binary-builder:$image_tag
+	# Each digest has a tag per architecture; only some also have one for
+	# both.
+	image=clickhouse/binary-builder:${image_tag}_$image_arch
 	echo "building ClickHouse $version for $target in $image"
 
+	# The compiler is the image's own, $CC and $CXX in it: each version of
+	# ClickHouse pins its clang there.
 	cmake_options+=(
-		-DCMAKE_C_COMPILER=clang-23
-		-DCMAKE_CXX_COMPILER=clang++-23
 		"-DCMAKE_TOOLCHAIN_FILE=/src/cmake/linux/toolchain-$cmake_arch.cmake"
 	)
 
@@ -182,7 +191,7 @@ EOF
 			# The checkout belongs to the host user, whom git in the container
 			# does not know; the build asks git for the list of licenses.
 			git config --global --add safe.directory /src
-			cmake -S /src -B /ch-build "$@"
+			cmake -S /src -B /ch-build -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" "$@"
 			ninja -C /ch-build clickhouse-stripped
 		' bash "${cmake_options[@]}"
 }
